@@ -1,0 +1,219 @@
+# import and load dataset
+import os
+import pandas as pd
+import numpy as np
+
+# posibles rutas donde puede estar el dataset
+candidates = [
+  os.path.join('datasets','UJIIndoorLoc','trainingData.csv'),
+  os.path.join('datasets','UJIIndoorLoc','trainingData.csv').replace('/','\\'),
+  os.path.join('Asignaciones','Proyecto_2','trainingData.csv'),
+  'trainingData.csv'
+]
+for p in candidates:
+  if os.path.exists(p):
+    df = pd.read_csv(p)
+    print(f"Loaded dataset from: {p}")
+    break
+else:
+  raise FileNotFoundError(
+    "No se encontró 'trainingData.csv'. Coloca el archivo en 'datasets/UJIIndoorLoc/' o actualiza la ruta en esta celda.")
+
+print('Dataset shape:', df.shape)
+display(df.head())
+if 'FLOOR' in df.columns:
+  print('\nFLOOR value counts:')
+  print(df['FLOOR'].value_counts())
+else:
+  print("Advertencia: la columna 'FLOOR' no se encontró en el dataset.")
+
+  # Preparar los datos: eliminar columnas no relevantes y separar X/y
+cols_to_drop = ['LONGITUDE','LATITUDE','SPACEID','RELATIVEPOSITION','USERID','PHONEID','TIMESTAMP']
+cols_present = [c for c in cols_to_drop if c in df.columns]
+if cols_present:
+  df = df.drop(columns=cols_present)
+
+# detectar columnas WAP (soporta WAP001..WAP520 u otras variantes)
+wap_cols = [c for c in df.columns if str(c).upper().startswith('WAP')]
+if len(wap_cols) == 0:
+  raise KeyError('No se encontraron columnas WAP en el dataset')
+
+if 'FLOOR' not in df.columns:
+  raise KeyError('La columna objetivo "FLOOR" no está presente')
+
+X = df[wap_cols].copy()
+y = df['FLOOR'].astype(int).copy()
+
+print('WAP features count:', len(wap_cols))
+print('X shape:', X.shape)
+# Preprocesamiento de señales WiFi: mapear 100 -> -100
+# Algunos registros usan 100 para indicar 'no detectado', lo convertimos a -100 (ausencia de señal)
+X.replace(100, -100, inplace=True)
+
+# comprobar rangos y valores atípicos simples
+print('Valores mínimos y máximos en X:', X.values.min(), X.values.max())
+num_no_signal = (X == -100).sum().sum()
+print('Total de celdas marcadas como no detectadas (-100):', num_no_signal)
+  # Entrenamiento y búsqueda de hiperparámetros (GridSearchCV) para todos los modelos
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.naive_bayes import GaussianNB
+from sklearn.linear_model import LogisticRegression
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.svm import SVC
+from sklearn.ensemble import RandomForestClassifier
+import joblib
+
+# split train/validation
+X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, stratify=y, random_state=42)
+print('X_train, X_val shapes:', X_train.shape, X_val.shape)
+
+# definir pipelines y grillas de parámetros
+models = {}
+param_grids = {}
+models['KNN'] = Pipeline([('scaler', StandardScaler()), ('clf', KNeighborsClassifier())])
+param_grids['KNN'] = {'clf__n_neighbors':[3,5,7], 'clf__weights':['uniform','distance']}
+
+models['GaussianNB'] = Pipeline([('clf', GaussianNB())])
+param_grids['GaussianNB'] = {'clf__var_smoothing':[1e-9,1e-8,1e-7]}
+
+models['LogisticRegression'] = Pipeline([('scaler', StandardScaler()), ('clf', LogisticRegression(max_iter=2000, multi_class='multinomial'))])
+param_grids['LogisticRegression'] = {'clf__C':[0.1,1,10]}
+
+models['DecisionTree'] = Pipeline([('clf', DecisionTreeClassifier(random_state=42))])
+param_grids['DecisionTree'] = {'clf__max_depth':[10,20,None], 'clf__criterion':['gini','entropy']}
+
+models['SVM'] = Pipeline([('scaler', StandardScaler()), ('clf', SVC(probability=True))])
+param_grids['SVM'] = {'clf__C':[1,10], 'clf__kernel':['rbf','linear'], 'clf__gamma':['scale','auto']}
+
+models['RandomForest'] = Pipeline([('clf', RandomForestClassifier(random_state=42))])
+param_grids['RandomForest'] = {'clf__n_estimators':[100,200], 'clf__max_depth':[10,20,None]}
+
+best_estimators = {}
+best_params = {}
+for name in models:
+  print(f'GridSearchCV -> {name}')
+  gs = GridSearchCV(models[name], param_grids[name], cv=5, scoring='accuracy', n_jobs=-1, verbose=1)
+  gs.fit(X_train, y_train)
+  best_estimators[name] = gs.best_estimator_
+  best_params[name] = gs.best_params_
+  print(f"{name} best params: {gs.best_params_} | cv best score: {gs.best_score_:.4f}")
+  joblib.dump(gs.best_estimator_, f'best_{name}.joblib')
+  # Función para cargar training y validation, limpiar columnas y devolver X/y
+def load_uji_data(train_path, test_path=None):
+  import pandas as pd
+  # cargar training
+  train = pd.read_csv(train_path)
+  if test_path is not None:
+    test = pd.read_csv(test_path)
+  else:
+    test = None
+
+  cols_to_drop = ['LONGITUDE','LATITUDE','SPACEID','RELATIVEPOSITION','USERID','PHONEID','TIMESTAMP']
+  cols_to_drop = [c for c in cols_to_drop if c in train.columns]
+  train = train.drop(columns=cols_to_drop)
+  if test is not None:
+    test = test.drop(columns=[c for c in cols_to_drop if c in test.columns])
+
+  wap_cols = [c for c in train.columns if str(c).upper().startswith('WAP')]
+  # map 100 -> -100
+  train[wap_cols] = train[wap_cols].replace(100, -100)
+   if test is not None:
+    test[wap_cols] = test[wap_cols].replace(100, -100)
+
+  X_train = train[wap_cols].copy()
+  y_train = train['FLOOR'].astype(int).copy()
+  if test is not None:
+    X_test = test[wap_cols].copy()
+    y_test = test['FLOOR'].astype(int).copy()
+  else:
+    X_test = y_test = None
+
+  return X_train, X_test, y_train, y_test
+
+# ejemplo de uso (si existen los archivos):
+train_path = None
+for p in [os.path.join('datasets','UJIIndoorLoc','trainingData.csv'), 'trainingData.csv']:
+  if os.path.exists(p):
+    train_path = p
+    break
+if train_path is None:
+print('No se encontró trainingData.csv para la función load_uji_data. Proporciona la ruta.')
+# Evaluación final en conjunto de prueba (usa validationData.csv si está disponible)
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+from sklearn.preprocessing import label_binarize
+import time
+import joblib
+import numpy as np
+
+# intentar cargar trainingData/validationData si existen
+train_csv = None
+test_csv = None
+for p in ['datasets/UJIIndoorLoc/trainingData.csv','trainingData.csv']:
+  if os.path.exists(p):
+    train_csv = p
+    break
+for p in ['datasets/UJIIndoorLoc/validationData.csv','validationData.csv']:
+  if os.path.exists(p):
+    test_csv = p
+    break
+
+if train_csv and test_csv:
+X_train_full, X_test, y_train_full, y_test = load_uji_data(train_csv, test_csv)
+else:
+  print('No se encontró validationData.csv; usando split interno X_train/X_val como proxy')
+  X_train_full, y_train_full = X_train, y_train
+  X_test, y_test = X_val, y_val
+
+results = []
+classes = np.unique(y_train_full)
+try:
+  y_test_binarized = label_binarize(y_test, classes=classes)
+except Exception:
+  y_test_binarized = None
+
+for name, est in best_estimators.items():
+  print('\nEvaluando modelo:', name)
+  start = time.time()
+  est.fit(X_train_full, y_train_full)
+  train_time = time.time() - start
+  start = time.time()
+  y_pred = est.predict(X_test)
+  test_time = time.time() - start
+
+  acc = accuracy_score(y_test, y_pred)
+  prec = precision_score(y_test, y_pred, average='macro', zero_division=0)
+  rec = recall_score(y_test, y_pred, average='macro', zero_division=0)
+  f1 = f1_score(y_test, y_pred, average='macro', zero_division=0)
+
+  # AUC multiclase OVR si es posible
+  try:
+    if hasattr(est, 'predict_proba'):
+      y_proba = est.predict_proba(X_test)
+    else:
+      y_proba = est.decision_function(X_test)
+      if y_proba.ndim == 1:
+        y_proba = np.vstack([1 - y_proba, y_proba]).T
+    if y_test_binarized is not None:
+      auc = roc_auc_score(y_test_binarized, y_proba, average='macro', multi_class='ovr')
+    else:
+      auc = np.nan
+  except Exception:
+  auc = np.nan
+
+  results.append({
+    'model': name,
+    'accuracy': acc,
+    'precision_macro': prec,
+    'recall_macro': rec,
+    'f1_macro': f1,
+    'auc_macro': auc,
+    'train_time_s': train_time,
+    'test_time_s': test_time
+  })
+
+import pandas as pd
+res_df = pd.DataFrame(results).sort_values('f1_macro', ascending=False)
+display(res_df)
